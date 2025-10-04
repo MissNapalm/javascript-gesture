@@ -174,11 +174,18 @@
             z-index: 999;
             display: none;
             box-shadow: 0 0 20px rgba(66, 133, 244, 0.6);
+            transition: all 0.1s ease;
         }
 
         .pinch-dot.active {
             display: block;
+        }
+        
+        .pinch-dot.pinching {
             animation: pulse 0.6s ease-in-out infinite;
+            border-color: #00ff00;
+            background: rgba(0, 255, 0, 0.4);
+            box-shadow: 0 0 30px rgba(0, 255, 0, 0.8);
         }
 
         @keyframes pulse {
@@ -334,6 +341,11 @@
                 this.lastPinchDist = null;
                 this.overlayInjected = false;
                 
+                // Velocity tracking for momentum scrolling
+                this.velocity = { x: 0, y: 0 };
+                this.lastMoveTime = 0;
+                this.scrollHistory = [];
+                
                 this.setupEventListeners();
             }
 
@@ -405,25 +417,13 @@
                     
                     // Drawing function called from parent
                     window.drawHands = function(handsData) {
-                        console.log('✋ drawHands called with', handsData ? handsData.length : 0, 'hands');
                         ctx.clearRect(0, 0, overlay.width, overlay.height);
                         
-                        // Test: Draw green circle to prove function is called
-                        ctx.fillStyle = 'lime';
-                        ctx.beginPath();
-                        ctx.arc(100, 100, 30, 0, 2 * Math.PI);
-                        ctx.fill();
-                        
                         if (!handsData || handsData.length === 0) {
-                            console.log('No hand data to draw');
                             return;
                         }
                         
-                        console.log('Drawing', handsData.length, 'hands with', handsData[0].landmarks.length, 'landmarks');
-                        
                         handsData.forEach((hand, idx) => {
-                            console.log('Hand', idx, 'first landmark:', hand.landmarks[0]);
-                            
                             // Draw connections
                             ctx.strokeStyle = '#0088FF';
                             ctx.lineWidth = 4;
@@ -501,19 +501,91 @@
             }
 
             handleSinglePinch(position) {
-                const x = position.x * window.innerWidth;
-                const y = position.y * window.innerHeight;
+                const rect = this.webview.getBoundingClientRect();
+                const x = position.x * rect.width;
+                const y = position.y * rect.height;
+                const now = Date.now();
 
                 if (this.lastPinchPos) {
                     const dx = x - this.lastPinchPos.x;
                     const dy = y - this.lastPinchPos.y;
+                    const dt = now - this.lastMoveTime;
                     
+                    // Calculate velocity (pixels per ms)
+                    if (dt > 0) {
+                        const vx = dx / dt;
+                        const vy = dy / dt;
+                        
+                        // Keep scroll history for momentum calculation
+                        this.scrollHistory.push({ vx, vy, time: now });
+                        
+                        // Keep only recent history (last 100ms)
+                        this.scrollHistory = this.scrollHistory.filter(h => now - h.time < 100);
+                    }
+                    
+                    // Immediate scroll response with amplification
                     this.webview.executeJavaScript(`
-                        window.scrollBy(${-dx}, ${-dy});
+                        window.scrollBy(${-dx * 3}, ${-dy * 3});
                     `);
                 }
 
                 this.lastPinchPos = { x, y };
+                this.lastMoveTime = now;
+            }
+
+            handlePinchRelease() {
+                // Calculate average velocity from recent history
+                if (this.scrollHistory.length > 0) {
+                    const avgVx = this.scrollHistory.reduce((sum, h) => sum + h.vx, 0) / this.scrollHistory.length;
+                    const avgVy = this.scrollHistory.reduce((sum, h) => sum + h.vy, 0) / this.scrollHistory.length;
+                    
+                    // Apply momentum scroll with deceleration
+                    const momentumX = Math.round(-avgVx * 800);
+                    const momentumY = Math.round(-avgVy * 800);
+                    
+                    // Only apply momentum if there's significant velocity
+                    if (Math.abs(momentumX) > 10 || Math.abs(momentumY) > 10) {
+                        this.webview.executeJavaScript(`
+                            (function() {
+                                const startScroll = { x: window.scrollX, y: window.scrollY };
+                                const targetScroll = { 
+                                    x: window.scrollX + ${momentumX}, 
+                                    y: window.scrollY + ${momentumY} 
+                                };
+                                
+                                let startTime = null;
+                                const duration = 600;
+                                
+                                function easeOutCubic(t) {
+                                    return 1 - Math.pow(1 - t, 3);
+                                }
+                                
+                                function animate(currentTime) {
+                                    if (!startTime) startTime = currentTime;
+                                    const elapsed = currentTime - startTime;
+                                    const progress = Math.min(elapsed / duration, 1);
+                                    const eased = easeOutCubic(progress);
+                                    
+                                    window.scrollTo(
+                                        startScroll.x + (targetScroll.x - startScroll.x) * eased,
+                                        startScroll.y + (targetScroll.y - startScroll.y) * eased
+                                    );
+                                    
+                                    if (progress < 1) {
+                                        requestAnimationFrame(animate);
+                                    }
+                                }
+                                
+                                requestAnimationFrame(animate);
+                            })();
+                        `).catch(err => {
+                            console.log('Momentum scroll error (page may not be ready):', err.message);
+                        });
+                    }
+                }
+                
+                // Clear history
+                this.scrollHistory = [];
             }
 
             handleTwoHandPinch(pos1, pos2) {
@@ -541,6 +613,11 @@
             }
 
             resetGesture() {
+                // Trigger momentum when pinch is released
+                if (this.lastPinchPos !== null) {
+                    this.handlePinchRelease();
+                }
+                
                 this.lastPinchPos = null;
                 this.lastPinchDist = null;
             }
@@ -698,36 +775,29 @@
             
             if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
                 results.multiHandLandmarks.forEach((landmarks, idx) => {
-                    // Get webview dimensions
+                    // Get webview dimensions (just width/height, not position)
                     const webview = document.getElementById('webview');
                     const rect = webview.getBoundingClientRect();
                     
-                    // Convert normalized coordinates to webview coordinates
-                    const screenLandmarks = landmarks.map(point => ({
-                        x: point.x * rect.width,
-                        y: point.y * rect.height,
-                        z: point.z
-                    }));
-
-                    // Prepare connections
-                    const connections = [];
-                    HAND_CONNECTIONS.forEach(connection => {
-                        connections.push({
-                            start: screenLandmarks[connection[0]],
-                            end: screenLandmarks[connection[1]]
-                        });
-                    });
-
-                    handsData.push({
-                        landmarks: screenLandmarks,
-                        connections: connections
-                    });
+                    // Get index finger tip position (landmark 8)
+                    const indexTip = landmarks[8];
+                    const aimPosition = {
+                        x: gestureController.smooth(`aim_x_${idx}`, 1 - indexTip.x),
+                        y: gestureController.smooth(`aim_y_${idx}`, indexTip.y)
+                    };
+                    
+                    // Show aim indicator for this hand
+                    if (idx === 0) {
+                        updatePinchDot(pinchDot1, aimPosition, true, gestureController.isPinching(landmarks));
+                    } else if (idx === 1) {
+                        updatePinchDot(pinchDot2, aimPosition, true, gestureController.isPinching(landmarks));
+                    }
 
                     // Check for pinching
                     if (gestureController.isPinching(landmarks)) {
                         const pos = gestureController.getPinchPosition(landmarks);
                         pinches.push({
-                            x: gestureController.smooth(`x_${idx}`, pos.x),
+                            x: gestureController.smooth(`x_${idx}`, 1 - pos.x),
                             y: gestureController.smooth(`y_${idx}`, pos.y)
                         });
                     }
@@ -740,38 +810,49 @@
                         gestureIndicator.textContent = `Swipe ${swipe} detected`;
                     }
                 });
+            } else {
+                // No hands - hide all indicators
+                updatePinchDot(pinchDot1, null, false, false);
+                updatePinchDot(pinchDot2, null, false, false);
             }
             
-            // Draw hands in the webview
-            console.log('📤 Sending', handsData.length, 'hands to webview');
-            browserController.drawHandsInWebview(handsData);
+            // Draw hands in the webview - DISABLED, only showing pinch indicators
+            // console.log('📤 Sending', handsData.length, 'hands to webview');
+            // browserController.drawHandsInWebview(handsData);
             
             // Handle pinch gestures
             if (pinches.length === 1) {
                 browserController.handleSinglePinch(pinches[0]);
-                updatePinchDot(pinchDot1, pinches[0], true);
-                updatePinchDot(pinchDot2, null, false);
                 gestureIndicator.textContent = '🤏 Scrolling with single pinch';
             } else if (pinches.length >= 2) {
                 browserController.handleTwoHandPinch(pinches[0], pinches[1]);
-                updatePinchDot(pinchDot1, pinches[0], true);
-                updatePinchDot(pinchDot2, pinches[1], true);
                 gestureIndicator.textContent = '🤏🤏 Zooming with two-hand pinch';
             } else {
                 browserController.resetGesture();
-                updatePinchDot(pinchDot1, null, false);
-                updatePinchDot(pinchDot2, null, false);
-                gestureIndicator.textContent = 'Show pinch gesture to interact';
+                gestureIndicator.textContent = 'Aim with index finger';
             }
         }
 
-        function updatePinchDot(dot, position, active) {
+        function updatePinchDot(dot, position, active, isPinching) {
             if (active && position) {
-                dot.style.left = (position.x * window.innerWidth) + 'px';
-                dot.style.top = (position.y * window.innerHeight) + 'px';
+                // Get webview position on screen
+                const webview = document.getElementById('webview');
+                const rect = webview.getBoundingClientRect();
+                
+                // Position dot relative to webview position
+                dot.style.left = (rect.left + position.x * rect.width) + 'px';
+                dot.style.top = (rect.top + position.y * rect.height) + 'px';
                 dot.classList.add('active');
+                
+                // Different style when pinching
+                if (isPinching) {
+                    dot.classList.add('pinching');
+                } else {
+                    dot.classList.remove('pinching');
+                }
             } else {
                 dot.classList.remove('active');
+                dot.classList.remove('pinching');
             }
         }
 
